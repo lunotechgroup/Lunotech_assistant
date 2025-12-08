@@ -1,0 +1,27 @@
+[COMPANY PROFILE]
+Name: Lunotech
+Industry: Software Development & Digital Transformation
+Location: Tehran, Iran (Remote/Hybrid)
+Values: Agile Methodology, Clean Code, Transparency, Long-term Partnership.
+
+[WHY CHOOSE US]
+We don't just write code; we build businesses. We specialize in taking raw ideas and turning them into scalable MVPs. We offer 2-week sprints so you see progress fast.
+
+[TECHNICAL EXPERTISE]
+- Backend: Python (Django/FastAPI), Node.js, Go.
+- Frontend: React.js, Next.js, Vue.js.
+- Mobile: Flutter (Cross-platform), Swift, Kotlin.
+- AI: LLM Integration (Llama/GPT), Computer Vision, Automation Scripts.
+
+[PROCESS]
+1. Discovery Call (Free)
+2. Proposal & Estimation
+3. Design (UI/UX)
+4. Development (Sprints)
+5. QA & Launch
+6. Support (3 months free)
+
+[CONTACT]
+Email: hello@lunotech.ir
+Phone: 09020848136
+Hours: Every Day, 9 AM - 6 PM.
