@@ -17,7 +17,7 @@ app = Flask(__name__)
 CORS(app)
 
 AI_MODEL = "llama-3.1-8b-instant"
-HISTORY_LIMIT = 30  # <--- This is the variable that was missing/undefined
+HISTORY_LIMIT = 30 
 
 class DataStore:
     knowledge_base = ""
@@ -28,12 +28,16 @@ SESSIONS = {}
 
 # --- NODE 1: INITIALIZATION ---
 def initialize_system():
+    # Prevent re-initialization if already done
+    if data_store.groq_client: return
+
     api_key = os.environ.get("GROQ_API_KEY")
     if api_key:
         data_store.groq_client = Groq(api_key=api_key)
+    else:
+        logging.warning("⚠️ GROQ_API_KEY not found in environment variables!")
 
     kb_parts = []
-    # Load local files
     if os.path.exists('about.txt'):
         with open('about.txt', 'r', encoding='utf-8') as f:
             kb_parts.append(f"[COMPANY PROFILE]\n{f.read()}")
@@ -42,14 +46,20 @@ def initialize_system():
         try:
             df = pd.read_csv('services.csv')
             kb_parts.append(f"[SERVICES]\n{df.to_string(index=False)}")
-        except: pass
+        except Exception as e:
+            logging.error(f"Error loading services.csv: {e}")
 
     data_store.knowledge_base = "\n\n".join(kb_parts)
     logging.info("🧠 Brain Loaded.")
 
+# --- INITIALIZE ON IMPORT (REQUIRED FOR GUNICORN/RENDER) ---
+initialize_system()
+
 # --- NODE 2: TOOLS ---
 def call_ai(messages, json_mode=False, temperature=0.2):
-    if not data_store.groq_client: return None
+    if not data_store.groq_client: 
+        logging.error("AI Client not initialized!")
+        return None
     try:
         kwargs = {"messages": messages, "model": AI_MODEL, "temperature": temperature}
         if json_mode: kwargs["response_format"] = {"type": "json_object"}
@@ -59,12 +69,11 @@ def call_ai(messages, json_mode=False, temperature=0.2):
         return "{}" if json_mode else "System Error."
 
 def is_real_contact(contact_str):
-    """Strict Python Guard: Checks validity of phone/email."""
     if not contact_str: return False
     s = str(contact_str)
-    if "@" in s and "." in s: return True # Email
+    if "@" in s and "." in s: return True
     digits = re.sub(r"\D", "", s) 
-    if len(digits) >= 7: return True # Phone
+    if len(digits) >= 7: return True
     return False
 
 def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
@@ -96,11 +105,8 @@ def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
     except Exception as e:
         logging.error(f"Telegram Fail: {e}")
 
-# --- NODE 3: ANALYSIS (Smart Brain) ---
+# --- NODE 3: ANALYSIS ---
 def analyze_situation(session, user_message):
-    """
-    AI decides the STAGE and EXTRACTS data based on CONTEXT.
-    """
     profile = session['profile']
     context_dump = json.dumps(session['history'][-6:]) 
     
@@ -110,42 +116,33 @@ def analyze_situation(session, user_message):
     Current Msg: "{user_message}"
     Profile: {json.dumps(profile)}
     
-    Task 1: Extract Data (Name, Contact, Project).
-    Task 2: Determine Conversation STAGE based on INTENT.
+    Task: Determine STAGE and Extract Data.
     
-    STAGES DEFINITION:
+    STAGES:
     - 'GREETING': Hello, Hi.
-    - 'DISCOVERY': User stated a need like "I need a site" but no deal yet.
+    - 'DISCOVERY': User wants a service ("I need a site") but no deal yet.
     - 'CONSULTING': Asking technical questions.
-    - 'SALES_READY': User asks for PRICE, COST, TIMELINE, explicitly asks "Call me", OR provides contact info to proceed.
-    - 'URGENT': User says "Urgent", "ASAP", "Emergency".
+    - 'SALES_READY': User says "Yes", "I want to buy", "Call me", "Start now", "Price?".
+    - 'URGENT': User says "Urgent", "ASAP".
     
     CRITICAL RULES:
-    1. If user simply provides a phone number/email, classify as 'SALES_READY'.
-    2. If user says "I want a website", stage is 'DISCOVERY', NOT 'SALES_READY'.
-    3. 'contact': Capture raw text only if it looks like a valid phone/email.
+    1. If user says "Yes" or "Bale" to a proposal, stage IS 'SALES_READY'.
+    2. If user just says "Salam" or "Website", stage IS 'GREETING' or 'DISCOVERY'.
+    3. Contact extraction must be exact.
     
-    Output JSON: 
-    {{
-        "stage": "...", 
-        "name": "...", 
-        "contact": "...", 
-        "project_type": "..."
-    }}
+    Output JSON: {{ "stage": "...", "name": "...", "contact": "...", "project_type": "..." }}
     """
     try:
-        # Temperature 0.1 for high precision in classification
         response = call_ai([{"role": "system", "content": system_prompt}], json_mode=True, temperature=0.1)
+        if not response: return 'GREETING', False
+        
         data = json.loads(response)
         
-        # Update Profile
         if data.get('name'): profile['name'] = data['name']
         if data.get('project_type'): profile['project_type'] = data['project_type']
         
-        # Check for NEW contact in this specific message
         extracted_contact = data.get('contact')
         contact_found_now = False
-        
         if is_real_contact(extracted_contact):
             profile['contact'] = extracted_contact
             contact_found_now = True
@@ -157,43 +154,39 @@ def analyze_situation(session, user_message):
         logging.error(f"Analysis Failed: {e}")
         return 'GREETING', False
 
-# --- NODE 4: GENERATION (Executor) ---
+# --- NODE 4: GENERATION ---
 def generate_smart_response(session, user_message, stage, contact_found_now, language='en'):
     profile = session['profile']
     
-    # Language Config
     if language == 'fa':
         lang_instr = "Answer in Persian (Farsi). Tone: Professional & Polite."
     else:
-        lang_instr = "Answer in English. Tone: Professional & Helpful."
+        lang_instr = "Answer in English. Tone: Professional."
 
-    # Strategy Selection based on AI Stage
     strategy = ""
     
     if contact_found_now:
-        strategy = "CLOSING: Thank them warmly. Confirm an expert will call shortly."
+        strategy = "CLOSING: Thank them. Confirm an expert will call."
     
     elif profile.get('contact'):
-        # VIP Handling (We already have contact)
         if stage == 'URGENT':
-            strategy = "VIP URGENT: 'I have your number. Team alerted. Expect a call in 5 mins.'"
+            strategy = "VIP URGENT: 'I have your number. Team alerted.'"
         elif stage == 'SALES_READY':
-            strategy = "VIP SALES: 'I have your info. Sending the proposal/calling you immediately.'"
+            strategy = "VIP SALES: 'I have your info. Team will call you to finalize.'"
         else:
-            strategy = "VIP CONSULTANT: We have the number. Be helpful and answer questions. Do NOT ask for contact."
+            strategy = "VIP CONSULTANT: Answer questions helpfuly. Do NOT ask for contact."
             
     else:
-        # Standard Flow (No Contact yet)
         if stage == 'URGENT':
-            strategy = "URGENT: Stop explaining. Ask for phone number immediately."
+            strategy = "URGENT: Ask for phone number immediately."
         elif stage == 'SALES_READY':
-            strategy = "SALES: User wants to move forward (Price/Call). Say: 'To proceed, I need your contact info.'"
+            strategy = "SALES: 'To proceed/give price, I need your contact info.'"
         elif stage == 'DISCOVERY':
-            strategy = "DISCOVERY: Acknowledge their project. Ask ONE strategic question (e.g., 'Do you have a design ready?'). DO NOT talk about tech stacks yet."
+            strategy = "DISCOVERY: Ask 1 key question about their project."
         elif stage == 'CONSULTING':
-            strategy = "ADVISOR: Give specific expert advice. Then ask a follow-up. Do NOT ask for contact yet."
+            strategy = "ADVISOR: Give advice. Ask follow up."
         else:
-            strategy = "GREETING: Welcome them. Ask how we can help."
+            strategy = "GREETING: Welcome them."
 
     system_prompt = f"""
     Role: Senior Lunotech Consultant.
@@ -201,11 +194,10 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
     Goal: {strategy}
     Info: {data_store.knowledge_base}
     
-    STRICT RULES:
+    RULES:
     1. {lang_instr}
     2. MAX 40 WORDS.
-    3. NO TECH JARGON (React, Node) unless user asked.
-    4. Focus on Business Value.
+    3. NO TECH JARGON.
     """
     
     messages = [{"role": "system", "content": system_prompt}]
@@ -216,11 +208,15 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
 
 # --- ROUTES ---
 
+@app.route('/', methods=['GET'])
+def health_check():
+    return "Lunotech AI is Running!", 200
+
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
     try:
         data = request.json
-        user_msg = data.get('message', '')  # Defined here as user_msg
+        user_msg = data.get('message', '')
         session_id = data.get('session_id', 'guest')
         stored_contact = data.get('stored_contact', None)
         site_lang = data.get('language', 'en')
@@ -239,31 +235,24 @@ def chat_endpoint():
                 session['profile']['contact'] = stored_contact
                 logging.info(f"🍪 Cookie Loaded: {stored_contact}")
 
-        # 1. AI Analysis
-        # Use user_msg here
+        # 1. Analyze
         stage, contact_found_now = analyze_situation(session, user_msg)
         
-        # 2. Strict Alert Logic
+        # 2. STRICT ALERT LOGIC
         should_alert = False
         has_contact = is_real_contact(session['profile'].get('contact'))
         
         ALLOWED_ALERT_STAGES = ['SALES_READY', 'URGENT']
-        
-        # Check for explicit agreement words (Python Safety Net)
         agreement_words = ["bale", "yes", "ok", "please", "بله", "باشه", "حتما", "تماس", "call"]
         is_agreement = any(w in user_msg.lower() for w in agreement_words)
 
-        # Trigger 1: New Contact Typed (Always Alert)
         if contact_found_now:
             should_alert = True
-            
-        # Trigger 2: Sales/Urgent Stage OR Agreement + We have contact
         elif (stage in ALLOWED_ALERT_STAGES or is_agreement) and has_contact:
             if not session.get('high_priority_alert_sent'):
                 should_alert = True
                 session['high_priority_alert_sent'] = True 
 
-        # Strict Block: Never alert on Greeting/Discovery unless a number was just given
         if stage in ['GREETING', 'DISCOVERY', 'CONSULTING'] and not contact_found_now and not is_agreement:
             should_alert = False
 
@@ -274,13 +263,11 @@ def chat_endpoint():
             session['alert_sent'] = True
             logging.info(f"🚨 Alert Sent: {alert_title}")
 
-        # 3. Generate Response
-        # FIX: Pass 'user_msg' (not 'user_message')
+        # 3. Respond
         bot_reply = generate_smart_response(session, user_msg, stage, contact_found_now, language=site_lang)
         
         session["history"].append({"role": "user", "content": user_msg})
         session["history"].append({"role": "assistant", "content": bot_reply})
-        # HISTORY_LIMIT is used here
         session["history"] = session["history"][-HISTORY_LIMIT:]
         
         return jsonify({
@@ -291,7 +278,7 @@ def chat_endpoint():
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        return jsonify({"text": "System Error.", "quick_replies": []})
+        return jsonify({"text": "System Error. Please try again.", "quick_replies": []}), 200
 
 @app.route('/report', methods=['POST'])
 def report_endpoint():
@@ -309,5 +296,5 @@ def report_endpoint():
         return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == '__main__':
-    initialize_system()
+    # Local Testing Only
     app.run(host='0.0.0.0', port=5000, debug=True)
