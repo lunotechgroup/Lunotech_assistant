@@ -28,14 +28,9 @@ SESSIONS = {}
 
 # --- NODE 1: INITIALIZATION ---
 def initialize_system():
-    # Prevent re-initialization if already done
-    if data_store.groq_client: return
-
     api_key = os.environ.get("GROQ_API_KEY")
     if api_key:
         data_store.groq_client = Groq(api_key=api_key)
-    else:
-        logging.warning("⚠️ GROQ_API_KEY not found in environment variables!")
 
     kb_parts = []
     if os.path.exists('about.txt'):
@@ -46,20 +41,14 @@ def initialize_system():
         try:
             df = pd.read_csv('services.csv')
             kb_parts.append(f"[SERVICES]\n{df.to_string(index=False)}")
-        except Exception as e:
-            logging.error(f"Error loading services.csv: {e}")
+        except: pass
 
     data_store.knowledge_base = "\n\n".join(kb_parts)
     logging.info("🧠 Brain Loaded.")
 
-# --- INITIALIZE ON IMPORT (REQUIRED FOR GUNICORN/RENDER) ---
-initialize_system()
-
 # --- NODE 2: TOOLS ---
 def call_ai(messages, json_mode=False, temperature=0.2):
-    if not data_store.groq_client: 
-        logging.error("AI Client not initialized!")
-        return None
+    if not data_store.groq_client: return None
     try:
         kwargs = {"messages": messages, "model": AI_MODEL, "temperature": temperature}
         if json_mode: kwargs["response_format"] = {"type": "json_object"}
@@ -69,61 +58,49 @@ def call_ai(messages, json_mode=False, temperature=0.2):
         return "{}" if json_mode else "System Error."
 
 def is_real_contact(contact_str):
+    """Checks validity of phone/email."""
     if not contact_str: return False
     s = str(contact_str)
-    if "@" in s and "." in s: return True
+    if "@" in s and "." in s: return True # Email
     digits = re.sub(r"\D", "", s) 
-    if len(digits) >= 7: return True
+    if len(digits) >= 7: return True # Phone
     return False
 
 def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
-    if not token or not chat_id:
-        logging.error("❌ Telegram Token or Chat ID missing from Environment Variables!")
-        return
+    if not token or not chat_id: return
 
     chat_log = ""
     for msg in history:
-        role = "User" if msg['role'] == "user" else "Bot"
-        chat_log += f"{role}: {msg['content']}\n"
+        icon = "👤" if msg['role'] == "user" else "🤖"
+        chat_log += f"{icon} {msg['content']}\n"
 
-    # Minimal formatting to ensure delivery (removed Markdown to prevent syntax errors)
     report = (
-        f"🚀 {title}\n"
+        f"🚀 **{title}**\n"
         f"👤 Name: {profile.get('name', 'Unknown')}\n"
-        f"📞 Contact: {profile.get('contact', 'N/A')}\n"
+        f"📞 Contact: `{profile.get('contact', 'N/A')}`\n"
         f"💼 Project: {profile.get('project_type', 'N/A')}\n"
         f"----------------------------\n"
-        f"📜 TRANSCRIPT:\n\n"
+        f"📜 **TRANSCRIPT:**\n\n"
         f"{chat_log}"
     )
 
-    # Truncate to avoid Telegram length limits
-    if len(report) > 4000: 
-        report = report[:4000] + "... (truncated)"
+    if len(report) > 4000: report = report[:4000] + "..."
 
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": report} # No parse_mode = Safer
-        
-        response = requests.post(url, json=payload)
-        
-        if response.status_code == 200:
-            logging.info(f"✅ Telegram Sent: {title}")
-        else:
-            # This will show you exactly WHY it failed in the Render logs
-            logging.error(f"❌ Telegram Fail: {response.status_code} - {response.text}")
-            
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                      json={"chat_id": chat_id, "text": report, "parse_mode": "Markdown"})
+        logging.info(f"✅ Telegram Sent: {title}")
     except Exception as e:
-        logging.error(f"❌ Telegram Connection Error: {e}")
+        logging.error(f"Telegram Fail: {e}")
 
-# --- NODE 3: ANALYSIS ---
+# --- NODE 3: ANALYSIS (Fixed for Ghost Alerts) ---
 def analyze_situation(session, user_message):
     profile = session['profile']
     context_dump = json.dumps(session['history'][-6:]) 
     
+    # Updated Prompt: Force 'Discovery' for simple requests
     system_prompt = f"""
     Role: Strategic AI Analyst.
     Context: {context_dump}
@@ -133,23 +110,21 @@ def analyze_situation(session, user_message):
     Task: Determine STAGE and Extract Data.
     
     STAGES:
-    - 'GREETING': Hello, Hi.
-    - 'DISCOVERY': User wants a service ("I need a site") but no deal yet.
-    - 'CONSULTING': Asking technical questions.
-    - 'SALES_READY': User says "Yes", "I want to buy", "Call me", "Start now", "Price?".
-    - 'URGENT': User says "Urgent", "ASAP".
+    - 'GREETING': Hello, Hi, Salam.
+    - 'DISCOVERY': User says "I need a website", "I have a restaurant", "Do you do apps?". (NO ALERT)
+    - 'CONSULTING': Asking about details, features, tech. (NO ALERT)
+    - 'SALES_READY': User EXPLICITLY says "Yes", "Call me", "Send invoice", or gives Phone Number. (ALERT)
+    - 'URGENT': User says "Urgent", "ASAP". (ALERT)
     
     CRITICAL RULES:
-    1. If user says "Yes" or "Bale" to a proposal, stage IS 'SALES_READY'.
-    2. If user just says "Salam" or "Website", stage IS 'GREETING' or 'DISCOVERY'.
-    3. Contact extraction must be exact.
+    1. "I want a website" = DISCOVERY.
+    2. "Yes" or "Bale" = SALES_READY.
+    3. Extract contact ONLY if present in the text.
     
     Output JSON: {{ "stage": "...", "name": "...", "contact": "...", "project_type": "..." }}
     """
     try:
         response = call_ai([{"role": "system", "content": system_prompt}], json_mode=True, temperature=0.1)
-        if not response: return 'GREETING', False
-        
         data = json.loads(response)
         
         if data.get('name'): profile['name'] = data['name']
@@ -157,15 +132,26 @@ def analyze_situation(session, user_message):
         
         extracted_contact = data.get('contact')
         contact_found_now = False
+        
+        # --- CRITICAL FIX: VERIFY CONTACT IS IN TEXT ---
+        # The AI sometimes "remembers" contact from context. 
+        # We must check if the user actually typed it NOW.
         if is_real_contact(extracted_contact):
-            profile['contact'] = extracted_contact
-            contact_found_now = True
+            # Check if at least 4 digits of the extracted number exist in the user message
+            clean_extracted = re.sub(r"\D", "", str(extracted_contact))
+            clean_msg = re.sub(r"\D", "", str(user_message))
+            
+            # Allow email if '@' in message, or Phone if digits match
+            is_in_text = (clean_extracted in clean_msg) if len(clean_extracted) > 5 else (str(extracted_contact) in user_message)
+            
+            if is_in_text:
+                profile['contact'] = extracted_contact
+                contact_found_now = True
             
         session['profile'] = profile
         return data.get('stage', 'GREETING'), contact_found_now
         
-    except Exception as e:
-        logging.error(f"Analysis Failed: {e}")
+    except:
         return 'GREETING', False
 
 # --- NODE 4: GENERATION ---
@@ -196,7 +182,7 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
         elif stage == 'SALES_READY':
             strategy = "SALES: 'To proceed/give price, I need your contact info.'"
         elif stage == 'DISCOVERY':
-            strategy = "DISCOVERY: Ask 1 key question about their project."
+            strategy = "DISCOVERY: Acknowledge project. Ask 1 key question to understand their needs."
         elif stage == 'CONSULTING':
             strategy = "ADVISOR: Give advice. Ask follow up."
         else:
@@ -221,10 +207,6 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
     return call_ai(messages)
 
 # --- ROUTES ---
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return "Lunotech AI is Running!", 200
 
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
@@ -256,23 +238,31 @@ def chat_endpoint():
         should_alert = False
         has_contact = is_real_contact(session['profile'].get('contact'))
         
-        ALLOWED_ALERT_STAGES = ['SALES_READY', 'URGENT']
+        # Explicit agreement words
         agreement_words = ["bale", "yes", "ok", "please", "بله", "باشه", "حتما", "تماس", "call"]
         is_agreement = any(w in user_msg.lower() for w in agreement_words)
 
+        # Trigger 1: User JUST typed a new number (Real verification in analyze_situation)
         if contact_found_now:
             should_alert = True
-        elif (stage in ALLOWED_ALERT_STAGES or is_agreement) and has_contact:
+            
+        # Trigger 2: SALES/URGENT *OR* Explicit Agreement + We have Contact
+        # This filters out "Discovery" alerts because stage won't be SALES_READY
+        elif (stage in ['SALES_READY', 'URGENT'] or is_agreement) and has_contact:
             if not session.get('high_priority_alert_sent'):
                 should_alert = True
                 session['high_priority_alert_sent'] = True 
 
+        # BLOCKER: Force no alert for Greeting/Discovery unless explicit agreement or contact found
         if stage in ['GREETING', 'DISCOVERY', 'CONSULTING'] and not contact_found_now and not is_agreement:
             should_alert = False
 
         if should_alert:
             temp_history = session["history"] + [{"role": "user", "content": user_msg}]
-            alert_title = "HOT LEAD - SALES READY" if is_agreement else f"HOT LEAD - {stage}"
+            # Better Title
+            alert_title = "HOT LEAD - AGREEMENT" if is_agreement else f"HOT LEAD - {stage}"
+            if contact_found_now: alert_title = "HOT LEAD - NEW CONTACT"
+            
             send_telegram(session_id, session['profile'], temp_history, title=alert_title)
             session['alert_sent'] = True
             logging.info(f"🚨 Alert Sent: {alert_title}")
@@ -292,7 +282,7 @@ def chat_endpoint():
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        return jsonify({"text": "System Error. Please try again.", "quick_replies": []}), 200
+        return jsonify({"text": "System Error.", "quick_replies": []})
 
 @app.route('/report', methods=['POST'])
 def report_endpoint():
@@ -310,6 +300,5 @@ def report_endpoint():
         return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == '__main__':
-    # Local Testing Only
+    initialize_system()
     app.run(host='0.0.0.0', port=5000, debug=True)
-
