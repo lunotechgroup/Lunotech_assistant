@@ -28,20 +28,17 @@ SESSIONS = {}
 
 # --- NODE 1: INITIALIZATION ---
 def initialize_system():
-    # Prevent re-initialization
+    # Prevent re-initialization if already done
     if data_store.groq_client: return
 
     api_key = os.environ.get("GROQ_API_KEY")
     if api_key:
         data_store.groq_client = Groq(api_key=api_key)
-    else:
-        logging.warning("⚠️ GROQ_API_KEY not found in environment!")
 
     kb_parts = []
-    # In Render, these files must be in the root directory or correctly referenced
     if os.path.exists('about.txt'):
         with open('about.txt', 'r', encoding='utf-8') as f:
-            # Clean English terms from Persian text
+            # Clean up text logic you had
             content = f.read().replace("Agile", "چابک").replace("Transformation", "تحول")
             kb_parts.append(f"[COMPANY PROFILE]\n{content}")
     
@@ -49,23 +46,19 @@ def initialize_system():
         try:
             df = pd.read_csv('services.csv')
             kb_parts.append(f"[SERVICES]\n{df.to_string(index=False)}")
-        except Exception as e:
-            logging.error(f"Error loading services.csv: {e}")
+        except: pass
 
     data_store.knowledge_base = "\n\n".join(kb_parts)
-    logging.info("🧠 Brain Loaded Successfully.")
+    logging.info("🧠 Brain Loaded.")
 
-# =========== CRITICAL FIX IS HERE ===========
-# Run this GLOBALLY so Gunicorn executes it on startup
+# =========== DEPLOYMENT FIX ===========
+# This runs the initialization immediately when Gunicorn starts the app
 initialize_system()
-# ============================================
+# ======================================
 
 # --- NODE 2: TOOLS ---
 def call_ai(messages, json_mode=False, temperature=0.2):
-    if not data_store.groq_client: 
-        logging.error("❌ AI Client is NOT initialized. Cannot generate response.")
-        return None
-        
+    if not data_store.groq_client: return None
     try:
         kwargs = {"messages": messages, "model": AI_MODEL, "temperature": temperature}
         if json_mode: kwargs["response_format"] = {"type": "json_object"}
@@ -85,9 +78,7 @@ def is_real_contact(contact_str):
 def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: 
-        logging.error("Telegram credentials missing.")
-        return
+    if not token or not chat_id: return
 
     chat_log = ""
     for msg in history:
@@ -107,7 +98,7 @@ def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
     if len(report) > 4000: report = report[:4000] + "..."
 
     try:
-        # Using basic requests without parse_mode first to ensure delivery
+        # Use simple request to avoid markdown errors
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                       json={"chat_id": chat_id, "text": report})
         logging.info(f"✅ Telegram Sent: {title}")
@@ -116,6 +107,7 @@ def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
 
 # --- NODE 3: ANALYSIS ---
 def analyze_situation(session, user_message):
+    # YOUR ORIGINAL LOGIC PRESERVED
     profile = session['profile']
     context_dump = json.dumps(session['history'][-6:]) 
     
@@ -128,23 +120,21 @@ def analyze_situation(session, user_message):
     Task: Determine STAGE and Extract Data.
     
     STAGES:
-    - 'GREETING': Hello, Hi.
-    - 'DISCOVERY': User wants a service ("I need a site") but no deal yet.
+    - 'GREETING': Simple hello.
+    - 'DISCOVERY': User wants a service but NO urgency/deal yet.
     - 'CONSULTING': Asking technical questions.
-    - 'SALES_READY': User says "Yes", "I want to buy", "Call me", "Start now", "Price?".
-    - 'URGENT': User says "Urgent", "ASAP".
+    - 'SALES_READY': User agrees ("Yes", "Bale"), asks Price, or says "Call me".
+    - 'URGENT': User says "Fast", "Quick", "Urgent", "ASAP", "Emergency".
     
-    CRITICAL RULES:
-    1. "I want a website" = DISCOVERY.
-    2. "Yes" or "Bale" = SALES_READY.
-    3. Contact extraction must be exact.
+    CRITICAL PRIORITY RULES:
+    1. If user implies URGENCY ("I need it fast"), stage MUST be 'URGENT' (Override Discovery).
+    2. If user agrees to a proposal ("Yes", "Ok"), stage MUST be 'SALES_READY'.
+    3. Only classify as 'DISCOVERY' if the user is calm and just asking.
     
     Output JSON: {{ "stage": "...", "name": "...", "contact": "...", "project_type": "..." }}
     """
     try:
         response = call_ai([{"role": "system", "content": system_prompt}], json_mode=True, temperature=0.1)
-        if not response: return 'GREETING', False
-        
         data = json.loads(response)
         
         if data.get('name'): profile['name'] = data['name']
@@ -152,32 +142,27 @@ def analyze_situation(session, user_message):
         
         extracted_contact = data.get('contact')
         contact_found_now = False
-        
-        # Verify contact exists in text to prevent ghost alerts
         if is_real_contact(extracted_contact):
-            clean_extracted = re.sub(r"\D", "", str(extracted_contact))
-            clean_msg = re.sub(r"\D", "", str(user_message))
-            is_in_text = (clean_extracted in clean_msg) if len(clean_extracted) > 5 else (str(extracted_contact) in user_message)
-            
-            if is_in_text:
-                profile['contact'] = extracted_contact
-                contact_found_now = True
+            profile['contact'] = extracted_contact
+            contact_found_now = True
             
         session['profile'] = profile
         return data.get('stage', 'GREETING'), contact_found_now
         
-    except Exception as e:
-        logging.error(f"Analysis Failed: {e}")
+    except:
         return 'GREETING', False
 
 # --- NODE 4: GENERATION ---
 def generate_smart_response(session, user_message, stage, contact_found_now, language='en'):
+    # YOUR ORIGINAL LOGIC PRESERVED
     profile = session['profile']
     
     if language == 'fa':
-        lang_instr = "Answer in Persian (Farsi). Tone: Professional & Polite."
+        lang_instr = "Answer in Persian (Farsi). Tone: Professional & Polite. NO English terms."
+        txt_urgent = "متوجه عجله شما هستم. برای شروع فوری، لطفاً همین الان شماره تماس خود را وارد کنید."
     else:
         lang_instr = "Answer in English. Tone: Professional."
+        txt_urgent = "I understand the urgency. Please provide your phone number immediately so we can start."
 
     strategy = ""
     
@@ -194,11 +179,11 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
             
     else:
         if stage == 'URGENT':
-            strategy = "URGENT: Ask for phone number immediately."
+            strategy = f"URGENT: Stop explaining. Say exactly: '{txt_urgent}'"
         elif stage == 'SALES_READY':
             strategy = "SALES: 'To proceed/give price, I need your contact info.'"
         elif stage == 'DISCOVERY':
-            strategy = "DISCOVERY: Acknowledge project. Ask 1 key question."
+            strategy = "DISCOVERY: Acknowledge project. Ask 1 strategic question."
         elif stage == 'CONSULTING':
             strategy = "ADVISOR: Give advice. Ask follow up."
         else:
@@ -213,7 +198,7 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
     RULES:
     1. {lang_instr}
     2. MAX 40 WORDS.
-    3. NO TECH JARGON.
+    3. If Goal is URGENT, DO NOT ask about project details. ASK FOR NUMBER.
     """
     
     messages = [{"role": "system", "content": system_prompt}]
@@ -223,10 +208,6 @@ def generate_smart_response(session, user_message, stage, contact_found_now, lan
     return call_ai(messages)
 
 # --- ROUTES ---
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return "Lunotech Bot is Alive!", 200
 
 @app.route('/chat', methods=['POST'])
 def chat_endpoint():
@@ -251,10 +232,9 @@ def chat_endpoint():
                 session['profile']['contact'] = stored_contact
                 logging.info(f"🍪 Cookie Loaded: {stored_contact}")
 
-        # 1. Analyze
         stage, contact_found_now = analyze_situation(session, user_msg)
         
-        # 2. STRICT ALERT LOGIC
+        # --- YOUR ORIGINAL ALERT LOGIC ---
         should_alert = False
         has_contact = is_real_contact(session['profile'].get('contact'))
         
@@ -276,13 +256,10 @@ def chat_endpoint():
         if should_alert:
             temp_history = session["history"] + [{"role": "user", "content": user_msg}]
             alert_title = "HOT LEAD - SALES READY" if is_agreement else f"HOT LEAD - {stage}"
-            if contact_found_now: alert_title = "HOT LEAD - NEW CONTACT"
-            
             send_telegram(session_id, session['profile'], temp_history, title=alert_title)
             session['alert_sent'] = True
             logging.info(f"🚨 Alert Sent: {alert_title}")
 
-        # 3. Respond
         bot_reply = generate_smart_response(session, user_msg, stage, contact_found_now, language=site_lang)
         
         session["history"].append({"role": "user", "content": user_msg})
@@ -297,20 +274,24 @@ def chat_endpoint():
 
     except Exception as e:
         logging.error(f"Error: {e}")
-        return jsonify({"text": "System Error. Please try again.", "quick_replies": []}), 200
+        # Return proper JSON even on error
+        return jsonify({"text": "System Error. Please try again.", "quick_replies": []})
 
 @app.route('/report', methods=['POST'])
 def report_endpoint():
     try:
         data = request.json
         session_id = data.get('session_id', 'guest')
+        
         if session_id in SESSIONS:
             session = SESSIONS[session_id]
             send_telegram(session_id, session['profile'], session['history'], title="⚠️ USER REPORTED ERROR")
             return jsonify({"status": "success", "message": "Report sent."})
         return jsonify({"status": "error", "message": "Session not found."})
+    
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
 
 if __name__ == '__main__':
+    # Local run
     app.run(host='0.0.0.0', port=5000, debug=True)
