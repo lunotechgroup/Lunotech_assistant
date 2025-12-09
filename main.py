@@ -79,31 +79,45 @@ def is_real_contact(contact_str):
 def send_telegram(session_id, profile, history, title="HOT LEAD CAPTURED"):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return
+    
+    if not token or not chat_id:
+        logging.error("❌ Telegram Token or Chat ID missing from Environment Variables!")
+        return
 
     chat_log = ""
     for msg in history:
-        icon = "👤" if msg['role'] == "user" else "🤖"
-        chat_log += f"{icon} {msg['content']}\n"
+        role = "User" if msg['role'] == "user" else "Bot"
+        chat_log += f"{role}: {msg['content']}\n"
 
+    # Minimal formatting to ensure delivery (removed Markdown to prevent syntax errors)
     report = (
-        f"🚨 **{title}**\n"
+        f"🚀 {title}\n"
         f"👤 Name: {profile.get('name', 'Unknown')}\n"
-        f"📞 Contact: `{profile.get('contact', 'N/A')}`\n"
+        f"📞 Contact: {profile.get('contact', 'N/A')}\n"
         f"💼 Project: {profile.get('project_type', 'N/A')}\n"
         f"----------------------------\n"
-        f"📜 **TRANSCRIPT:**\n\n"
+        f"📜 TRANSCRIPT:\n\n"
         f"{chat_log}"
     )
 
-    if len(report) > 4000: report = report[:4000] + "..."
+    # Truncate to avoid Telegram length limits
+    if len(report) > 4000: 
+        report = report[:4000] + "... (truncated)"
 
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                      json={"chat_id": chat_id, "text": report, "parse_mode": "Markdown"})
-        logging.info(f"✅ Telegram Sent: {title}")
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": report} # No parse_mode = Safer
+        
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            logging.info(f"✅ Telegram Sent: {title}")
+        else:
+            # This will show you exactly WHY it failed in the Render logs
+            logging.error(f"❌ Telegram Fail: {response.status_code} - {response.text}")
+            
     except Exception as e:
-        logging.error(f"Telegram Fail: {e}")
+        logging.error(f"❌ Telegram Connection Error: {e}")
 
 # --- NODE 3: ANALYSIS ---
 def analyze_situation(session, user_message):
@@ -298,3 +312,4 @@ def report_endpoint():
 if __name__ == '__main__':
     # Local Testing Only
     app.run(host='0.0.0.0', port=5000, debug=True)
+
